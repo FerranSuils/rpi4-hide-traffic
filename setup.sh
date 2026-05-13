@@ -402,8 +402,11 @@ EOF
     if [[ "$ENABLE_SNOWFLAKE" == "1" ]]; then
       cat <<'EOF'
 
-# Snowflake (público — actualiza desde bridges.torproject.org si deja de funcionar)
-Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://snowflake-broker.torproject.net.global.prod.fastly.net/ fronts=foursquare.com,github.githubassets.com ice=stun:stun.l.google.com:19302 utls-imitate=hellorandomizedalpn
+# Snowflake (público — broker en CDN77 desde 2024; el viejo en Fastly tiene
+# el certificado caducado y falla con x509 cert mismatch).
+# Si vuelve a romperse, saca la config nueva de:
+#   https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/raw/main/client/torrc
+Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://1098762253.rsc.cdn77.org/ fronts=www.cdn77.com,www.phpmyadmin.net ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.bluesip.net:3478,stun:stun.dus.net:3478,stun:stun.epygi.com:3478 utls-imitate=hellorandomizedalpn
 EOF
     fi
 
