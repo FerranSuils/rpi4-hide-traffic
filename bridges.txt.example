@@ -1,0 +1,17 @@
+# bridges.txt — bridges obfs4 para Tor
+#
+# Pega aquí las líneas "Bridge obfs4 ..." que consigas en:
+#   https://bridges.torproject.org/   (selecciona transport: obfs4)
+#   mail bridges@torproject.org con cuerpo "get transport obfs4"
+#   Telegram: @GetBridgesBot
+#
+# Una línea por bridge. Mejor 2-3 que uno solo.
+# Las líneas que NO empiecen por "Bridge " se ignoran (son comentarios).
+#
+# Ejemplo (NO uses estos — son ficticios, conseguí los tuyos):
+#
+# Bridge obfs4 192.0.2.10:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=AbCdEf...XyZ iat-mode=0
+# Bridge obfs4 198.51.100.5:9001 FEDCBA9876543210FEDCBA9876543210FEDCBA98 cert=ZyXwVu...ABC iat-mode=0
+#
+# Si no consigues bridges obfs4 ahora mismo, deja el archivo solo con
+# comentarios y exporta ENABLE_SNOWFLAKE=1 al ejecutar setup.sh.
