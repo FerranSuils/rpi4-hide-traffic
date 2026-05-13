@@ -402,8 +402,8 @@ table inet filter {
         ct state established,related accept
         ct state invalid drop
 
-        ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept limit rate 10/second
-        ip6 nexthdr icmpv6 accept limit rate 10/second
+        ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } limit rate 10/second accept
+        ip6 nexthdr icmpv6 limit rate 10/second accept
 
         iifname "$WAN_IFACE" jump wan_in
         iifname "$WIFI_IFACE" jump lan_in
