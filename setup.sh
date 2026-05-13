@@ -62,6 +62,10 @@ BRIDGES_FILE="${BRIDGES_FILE:-./bridges.txt}"
 ENABLE_SNOWFLAKE="${ENABLE_SNOWFLAKE:-1}"
 ENABLE_FWKNOP="${ENABLE_FWKNOP:-1}"
 SSH_PORT="${SSH_PORT:-22}"
+# Subredes (separadas por comas, sintaxis nftables) desde las que se
+# permite SSH entrante por la WAN. Por defecto vacío: SSH cerrado en eth0
+# y solo accesible vía fwknop SPA. Ejemplo: SSH_LAN_CIDR="192.168.1.0/24"
+SSH_LAN_CIDR="${SSH_LAN_CIDR:-}"
 
 BACKUP_DIR="/etc/onion-pi-backup-$(date +%Y%m%d-%H%M%S)"
 KEYS_OUT="/root/onion-pi-fwknop-keys.txt"
@@ -126,6 +130,21 @@ preflight() {
 
   if [[ ! -f "$BRIDGES_FILE" ]]; then
     warn "No hay '$BRIDGES_FILE' — usando solo snowflake."
+  else
+    local bcount
+    bcount=$(grep -cE '^(Bridge[[:space:]]+(obfs4|snowflake|meek_lite|webtunnel)|(obfs4|snowflake|meek_lite|webtunnel))[[:space:]]' "$BRIDGES_FILE" 2>/dev/null || true)
+    if (( bcount == 0 )); then
+      if [[ "$ENABLE_SNOWFLAKE" == "1" ]]; then
+        warn "'$BRIDGES_FILE' no contiene bridges válidos — usando solo snowflake."
+      else
+        err  "'$BRIDGES_FILE' no contiene bridges válidos y snowflake está desactivado."
+        err  "Solución: pega líneas 'obfs4 ...' o 'Bridge obfs4 ...' en $BRIDGES_FILE,"
+        err  "          o exporta ENABLE_SNOWFLAKE=1"
+        exit 1
+      fi
+    else
+      ok "Detectados $bcount bridge(s) en $BRIDGES_FILE"
+    fi
   fi
 
   ok "Preflight OK"
@@ -236,6 +255,7 @@ RemainAfterExit=yes
 ExecStart=/sbin/ip link set $WIFI_IFACE up
 ExecStart=/sbin/ip addr flush dev $WIFI_IFACE
 ExecStart=/sbin/ip addr add $GATEWAY_IP/$SUBNET_MASK_BITS dev $WIFI_IFACE
+ExecStartPost=/sbin/iw dev $WIFI_IFACE set power_save off
 ExecStop=/sbin/ip addr flush dev $WIFI_IFACE
 ExecStop=/sbin/ip link set $WIFI_IFACE down
 
@@ -253,6 +273,18 @@ configure_hostapd() {
   header "Configurando hostapd (AP $SSID)"
 
   install -d -m 755 /etc/hostapd
+  # Config minimalista para brcmfmac de la Pi 4 (firmware
+  # BCM4345/6 v7.45.265, paquete firmware-brcm80211 20250410):
+  #   * WPA2-PSK puro con SOLO `rsn_pairwise=CCMP` y `wpa_key_mgmt=WPA-PSK`.
+  #   * Sin `wpa_pairwise`, `ieee80211n/d`, `wmm_enabled` — el firmware
+  #     responde con `wpa_auth error -52` / `mfp error -52` si los incluyes.
+  #   * Sin SAE: aunque el AP arranca con `wpa_key_mgmt=SAE`, la firmware
+  #     falla el handshake con `brcmf_cfg80211_external_auth: status=1`,
+  #     así que el cliente nunca termina de autenticarse y se le deauth-ea
+  #     por inactividad. WPA3 NO funciona aquí, no lo intentes.
+  #   * El `ctrl_interface` permite usar `hostapd_cli` para debug.
+  #   * Tras cada cambio de config: NO encadenes `systemctl restart hostapd`;
+  #     el firmware se degrada. Un reboot limpia.
   cat > /etc/hostapd/hostapd.conf <<EOF
 # Generado por onion-pi setup
 interface=$WIFI_IFACE
@@ -261,15 +293,13 @@ ssid=$SSID
 hw_mode=g
 channel=$WIFI_CHANNEL
 country_code=$WIFI_COUNTRY
-ieee80211d=1
-ieee80211n=1
-wmm_enabled=1
 auth_algs=1
 wpa=2
 wpa_passphrase=$WIFI_PASS
 wpa_key_mgmt=WPA-PSK
-wpa_pairwise=CCMP
 rsn_pairwise=CCMP
+ctrl_interface=/var/run/hostapd
+ctrl_interface_group=0
 EOF
   chmod 600 /etc/hostapd/hostapd.conf
 
@@ -356,7 +386,17 @@ EOF
     if [[ -f "$BRIDGES_FILE" ]]; then
       echo ""
       echo "# obfs4 desde $BRIDGES_FILE"
-      grep -E '^Bridge ' "$BRIDGES_FILE" || true
+      # Acepta tanto "Bridge obfs4 ..." como "obfs4 ..." (sin prefijo).
+      # Ignora comentarios (#) y líneas en blanco.
+      while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"   # ltrim
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        if [[ "$line" =~ ^Bridge[[:space:]] ]]; then
+          echo "$line"
+        elif [[ "$line" =~ ^(obfs4|snowflake|meek_lite|webtunnel)[[:space:]] ]]; then
+          echo "Bridge $line"
+        fi
+      done < "$BRIDGES_FILE"
     fi
 
     if [[ "$ENABLE_SNOWFLAKE" == "1" ]]; then
@@ -410,6 +450,9 @@ table inet filter {
     }
 
     chain wan_in {
+$( [[ -n "$SSH_LAN_CIDR" ]] && for cidr in ${SSH_LAN_CIDR//,/ }; do
+     echo "        iifname \"$WAN_IFACE\" ip saddr $cidr tcp dport $SSH_PORT accept   comment \"SSH LAN $cidr\""
+   done )
         # SSH cerrado por defecto desde la WAN.
         # fwknopd añade reglas temporales aquí cuando recibe un SPA válido.
     }
