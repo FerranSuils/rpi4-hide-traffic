@@ -1,0 +1,9 @@
+# bridges.txt es per-instalación: cada usuario pega los suyos privados
+# obtenidos de https://bridges.torproject.org. No subirlos al repo público.
+bridges.txt
+
+# Backups que crea setup.sh en /etc — por si alguien copia el dir entero
+onion-pi-backup-*/
+
+# Logs locales
+*.log

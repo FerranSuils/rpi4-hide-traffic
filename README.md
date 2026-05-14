@@ -125,6 +125,143 @@ Si activas `ENABLE_FWKNOP=1` (es el default), el setup genera unas claves base64
 
 Guarda ese archivo bien. Si lo pierdes, lo más rápido es borrarlo y volver a correr el setup, que te regenerará claves nuevas.
 
+## Web UI (status + configuración desde la LAN del AP)
+
+Por defecto el setup levanta un panel web en `http://10.10.10.1` (la IP del gateway), accesible **sólo desde un cliente conectado al WiFi de la Pi**. Las reglas nftables exentan el tráfico hacia el gateway de la redirección a Tor para que puedas abrirla en el navegador.
+
+### Primer arranque: wizard de onboarding
+
+Cuando entras al UI por primera vez, te sale un **wizard de configuración** en `/setup` (no pide auth porque aún no hay admin pass). Te pide:
+
+- Usuario y contraseña del panel de admin
+- Opcionalmente: cambiar el SSID y la pass WiFi
+
+Tras finalizarlo, escribe `/etc/onion-pi-webui.initialized` y a partir de ahí todos los accesos requieren las credenciales que pusiste.
+
+Para resetear y volver a ver el wizard (p. ej. si pierdes la contraseña):
+
+```
+sudo rm /etc/onion-pi-webui.initialized /etc/onion-pi-webui.passwd
+sudo systemctl restart onion-pi-webui
+```
+
+Qué muestra:
+
+- Bootstrap actual de Tor (% y estado)
+- IP pública vista por Tor (cacheada cada 5 min vía `check.torproject.org`)
+- Servicios activos (hostapd, dnsmasq, tor, nftables, webui)
+- Clientes conectados con MAC, IP y nombre
+
+Qué puedes cambiar desde la web:
+
+- **SSID y contraseña WiFi** → reescribe `/etc/hostapd/hostapd.conf` y reinicia hostapd con un retraso de 3 s (para que la respuesta llegue antes del corte).
+- **Bridges Tor** → reescribe la sección `Bridge ...` de `/etc/tor/torrc` y reinicia Tor.
+- **OTA update manual** → lanza `/usr/local/sbin/onion-pi-ota-update.sh` en background.
+- **Reboot** → systemd reboot con confirmación.
+
+Las credenciales se generan en el primer `setup.sh` y se guardan en `/etc/onion-pi-webui.passwd`. Salen también impresas al final del setup. Si se borra ese fichero, el siguiente `setup.sh` genera unas nuevas.
+
+Variables:
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `ENABLE_WEBUI` | `1` | Levantar o no la web UI |
+| `WEBUI_PORT` | `80` | Puerto en `10.10.10.1` |
+
+> El proceso corre como **root** porque necesita reescribir `/etc/hostapd/hostapd.conf` y `/etc/tor/torrc`. La protección es HTTP Basic auth + binding exclusivo a la IP del gateway. No expongas este puerto al WAN.
+
+## OTA updates
+
+Si `ENABLE_OTA=1` (default), el setup deja preparados:
+
+- `/usr/local/sbin/onion-pi-ota-update.sh` → hace `git fetch` + `git merge --ff-only` sobre la rama configurada (default `master`), y si hay cambios re-ejecuta `setup.sh` (idempotente). Los SSID/pass actuales se preservan leyendo `/etc/hostapd/hostapd.conf`.
+- `/usr/local/bin/onion-pi-update` → wrapper amigable para uso desde shell.
+- `onion-pi-ota.timer` → corre el script semanal con jitter de hasta 1 h.
+- `/run/onion-pi-ota-state.json` → estado en vivo del proceso (`running`/`success`/`error`/`needs_reboot`) que la web UI consume para mostrarte progreso.
+
+### Desde el shell (CLI)
+
+```
+sudo onion-pi-update           # tira la actualización si la hay
+onion-pi-update --check        # sólo dice si hay update (no la aplica)
+onion-pi-update --status       # estado del último OTA
+```
+
+### Desde la web UI
+
+Botón "Comprobar OTA ahora" en el panel. Aparece un cuadro de progreso que se actualiza cada 2 s vía `/api/ota/status` mostrando la fase (`Comprobando cambios...`, `Descargando...`, `Aplicando configuración...`).
+
+Si el OTA detecta que **hace falta reiniciar la Pi** (kernel actualizado, módulos de firmware tocados, o `/var/run/reboot-required` presente), aparece un **banner rojo** arriba con un botón "Reiniciar ahora" — porque algunas cosas (drivers WiFi, kernel) no se pueden cargar sin reboot.
+
+### Variables
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `ENABLE_OTA` | `1` | Activar timer semanal |
+| `OTA_BRANCH` | `master` | Rama de la que tirar |
+
+Si trabajas activamente en el repo en este mismo host, pon `ENABLE_OTA=0` para evitar que un timer te haga reset a lo que haya en master.
+
+### Cómo publicar un update
+
+Como mantenedor, basta con hacer push a la rama `master` (o la que pongas en `OTA_BRANCH`). Cada Pi en el campo:
+
+1. El timer corre semanal (o el user le da al botón "Comprobar OTA ahora").
+2. El script hace `git fetch` + `git merge --ff-only`. Si hay divergencia local, aborta para no destruir cambios.
+3. Si hay cambios, re-ejecuta `setup.sh` que es idempotente.
+4. Si toca kernel/firmware → el state file marca `needs_reboot` y la web UI lo enseña.
+
+## Watchdog y auto-recuperación de bridges
+
+Para que el AP siga útil sin necesidad de meter mano cada vez que un bridge se cae, hay dos servicios encadenados:
+
+### Watchdog (`onion-pi-watchdog.timer`)
+
+Cada `WATCHDOG_INTERVAL_MIN` minutos (default 5) ejecuta dos tests reales:
+
+1. **DNS por Tor**: `dig @gateway -p 5353 example.com` debe resolver en <10 s
+2. **SOCKS por Tor**: `curl --socks5-hostname gateway:9050 check.torproject.org/api/ip` debe responder `IsTor:true` en <15 s
+
+Si alguno falla:
+
+1. **Reinicia `tor@default`** y reverifica
+2. Si tras restart sigue fallando, llama al **bridge-rescue**
+3. Si tras rescue sigue fallando, marca estado `error` en `/run/onion-pi-watchdog-state.json` → la web UI muestra banner rojo con instrucciones
+
+### Bridge rescue (`onion-pi-bridge-rescue.sh`)
+
+Cuando los bridges actuales no responden, rota a bridges públicos:
+
+1. **Pide bridges frescos al Moat builtin API** de Tor Project (`https://bridges.torproject.org/moat/circumvention/builtin`) — devuelve los obfs4 default que shipea Tor Browser, rotados por Tor Project cuando van cayendo
+2. Si Moat no responde (por censura o lo que sea), usa **`/etc/onion-pi/bridges_default.txt`** (lista bundled refrescable vía OTA)
+3. También considera los bridges actuales del torrc (por si alguno resucitó)
+4. Para cada candidato hace **TCP connect con timeout 3 s**
+5. Toma los primeros `BRIDGE_RESCUE_KEEP_N` (default 3) alive
+6. Reescribe el bloque `Bridge obfs4` de `/etc/tor/torrc` y reinicia Tor
+
+Disparadores:
+
+- **Automático**: lo llama el watchdog cuando el restart de Tor no fue suficiente
+- **CLI**: `sudo onion-pi-rescue-bridges`
+- **Web UI**: botón verde "Buscar bridges públicos nuevos" en la sección Bridges
+
+Logs en `/var/log/onion-pi-bridge-rescue.log` y `journalctl -t onion-pi-bridge-rescue`.
+
+### Variables relevantes
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `ENABLE_WATCHDOG` | `1` | Timer del watchdog |
+| `WATCHDOG_INTERVAL_MIN` | `5` | Frecuencia del watchdog (min) |
+| `ENABLE_BRIDGE_RESCUE` | `1` | Permitir que el watchdog rote bridges automáticamente |
+| `BRIDGE_RESCUE_KEEP_N` | `3` | Cuántos bridges alive aplicar |
+
+### Limitaciones
+
+- El pool público es **público**: en países con censura activa de Tor (China, Rusia, Irán) estos bridges están todos bloqueados. Necesitas bridges privados manualmente.
+- Si tu ISP en España empieza a filtrar también esos IPs en concreto, el rescue no podrá. La última línea de defensa siempre es: meter bridges privados en el textarea de la web UI.
+- El `bridges_default.txt` se refresca por OTA cuando mando un `git push` con la lista nueva (Tor Project los rota cada pocos meses).
+
 ## Healthcheck
 
 Hay un servicio systemd (`onion-pi-healthcheck.service`) que se ejecuta en cada arranque y comprueba que:
