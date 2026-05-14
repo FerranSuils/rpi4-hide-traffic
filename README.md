@@ -331,6 +331,65 @@ bridges.txt.example   plantilla con instrucciones
 
 `bridges.txt` no debería subirse al repo. Si lo haces público, ponlo en `.gitignore`.
 
+## Replicar la config en otra Pi
+
+Todo lo necesario para arrancar una Pi 4 idéntica está en este repo. Lo que NO se trackea (a propósito) es lo per-instalación: bridges privados, contraseñas, leases, etc. — eso lo regenera `setup.sh` localmente.
+
+**Pasos en la Pi nueva** (Raspberry Pi OS Lite / Debian 13, conectada por cable al router):
+
+```
+# 1. Clonar el repo
+git clone https://github.com/<tu-fork>/rpi4-hide-traffic.git
+cd rpi4-hide-traffic
+
+# 2. Poner los bridges obfs4 privados (recomendado, no obligatorio)
+#    Si no, exporta ENABLE_SNOWFLAKE=1 para tirar solo de snowflake.
+cp bridges.txt.example bridges.txt
+nano bridges.txt   # pega tus bridges aquí
+
+# 3. Lanzar el setup
+sudo WIFI_PASS='lacontraseña' ./setup.sh
+```
+
+Eso es todo. `setup.sh` se ocupa de:
+
+- Instalar todos los paquetes (`tor obfs4proxy hostapd dnsmasq nftables` + snowflake-client + fwknop-server + dnsutils + curl + git)
+- Generar `/etc/hostapd/hostapd.conf` con la SSID/pass (WPA2-PSK minimalista para no chocar con bugs del firmware brcmfmac)
+- Generar `/etc/tor/torrc` con bridges desde `bridges.txt` + snowflake
+- Generar `/etc/nftables.conf` con kill-switch, redirección a Tor, y reglas de bypass
+- Crear todos los servicios systemd: `onion-pi-wlan`, `onion-pi-webui`, `onion-pi-watchdog.timer`, `onion-pi-ota.timer`, `onion-pi-bypass-refresh.timer`, `onion-pi-healthcheck`
+- Crear los scripts en `/usr/local/sbin/`: watchdog, bridge-rescue, bypass-refresh, ota-update
+- Crear el CLI en `/usr/local/bin/`: `onion-pi-update`, `onion-pi-rescue-bridges`
+- Apagar power-save de wlan0 vía systemd drop-in
+- Generar `/etc/onion-pi/options.env` con todas las flags toggleables comentadas
+- Generar `/etc/onion-pi/bypass.txt` template (vacío salvo comentarios)
+
+**Tras el primer arranque**:
+
+1. Conecta un cliente al SSID nuevo (con la pass que pasaste)
+2. Abre `http://10.10.10.1` en el navegador
+3. Aparece el **wizard de onboarding** — establece usuario/contraseña de admin del panel
+4. Una vez dentro, puedes editar bridges, bypass list, etc. desde la UI
+
+**Activar Discord/Parsec/voz desde el principio en cada Pi nueva**:
+
+Si vas a vender el producto y quieres que todas las Pis tengan UDP bypass por defecto, edita `/etc/onion-pi/options.env` antes del primer arranque, o haz que tu fork del repo edite los defaults en `setup.sh`:
+
+```
+sudo sed -i 's/^#ENABLE_BYPASS_ALL_UDP=1/ENABLE_BYPASS_ALL_UDP=1/' /etc/onion-pi/options.env
+sudo ./setup.sh
+```
+
+**Idempotencia entre runs**: re-ejecutar `setup.sh` (manual o via OTA) preserva:
+- SSID y pass WiFi (las lee de `hostapd.conf` existente)
+- `bridges.txt` (no se toca)
+- `/etc/onion-pi/bypass.txt` (sólo se crea si no existe)
+- `/etc/onion-pi/options.env` (sólo se crea si no existe)
+- Credenciales del web UI y flag de onboarding
+- Claves fwknop generadas
+
+Lo que SÍ se regenera en cada run (con backup en `/etc/onion-pi-backup-AAAAMMDD-HHMMSS/`): `hostapd.conf`, `dnsmasq.conf`, `nftables.conf`, `torrc`, units systemd.
+
 ## Desinstalar
 
 No hay script de desinstalación, pero las configs originales están en `/etc/onion-pi-backup-*`. A grandes rasgos, para revertir:

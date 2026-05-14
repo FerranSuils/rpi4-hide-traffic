@@ -37,6 +37,15 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# Si hay opciones persistentes en /etc/onion-pi/options.env las cargamos
+# como defaults (las env vars del invocador siguen ganando). Esto permite
+# que tunear ENABLE_BYPASS_ALL_UDP=1 desde la web UI / shell persista entre
+# re-runs de setup.sh (incluido el OTA).
+if [[ -r /etc/onion-pi/options.env ]]; then
+  # shellcheck disable=SC1091
+  set -a; source /etc/onion-pi/options.env; set +a
+fi
+
 # ============================================================================
 # CONFIG
 # ============================================================================
@@ -88,12 +97,16 @@ WEBUI_PORT="${WEBUI_PORT:-80}"
 ENABLE_OTA="${ENABLE_OTA:-1}"
 OTA_BRANCH="${OTA_BRANCH:-master}"
 
-# Watchdog: cada N minutos comprueba que DNS+SOCKS pasan por Tor.
+# Watchdog: cada N segundos comprueba que DNS+SOCKS pasan por Tor.
 # Si fallan, reinicia Tor automáticamente. Si tras el reinicio aún falla,
-# marca el estado como error (visible en web UI) para que sepas que
-# probablemente los bridges están muertos y hay que actualizarlos.
+# escala a bridge-rescue. Si aún sigue mal, marca error en la UI.
+#
+# El COOLDOWN evita loops de restart: si un restart fue hace menos de
+# COOLDOWN segundos, el watchdog NO reinicia (solo observa). Útil para que
+# Tor tenga tiempo de bootstrapear (~30-60s) antes del siguiente intento.
 ENABLE_WATCHDOG="${ENABLE_WATCHDOG:-1}"
-WATCHDOG_INTERVAL_MIN="${WATCHDOG_INTERVAL_MIN:-5}"
+WATCHDOG_INTERVAL_SEC="${WATCHDOG_INTERVAL_SEC:-30}"
+WATCHDOG_COOLDOWN_SEC="${WATCHDOG_COOLDOWN_SEC:-90}"
 
 # Auto-fetch de bridges: cuando el watchdog detecta que Tor no enruta y
 # un reinicio no lo arregla, intenta sacar bridges nuevos del Moat builtin
@@ -103,6 +116,27 @@ WATCHDOG_INTERVAL_MIN="${WATCHDOG_INTERVAL_MIN:-5}"
 ENABLE_BRIDGE_RESCUE="${ENABLE_BRIDGE_RESCUE:-1}"
 BRIDGE_RESCUE_KEEP_N="${BRIDGE_RESCUE_KEEP_N:-3}"
 
+# Bypass list: dominios/IPs/CIDRs cuyo tráfico sale DIRECTO por eth0
+# (sin Tor) — para apps con UDP/voz que no pueden ir por Tor: Discord
+# voz, Parsec, juegos, llamadas. Compromiso explícito: el ISP y el servicio
+# destino verán tu IP real para esos hosts.
+#
+# Para que UDP/forwarding funcione, esto pone net.ipv4.ip_forward=1 y crea
+# reglas de masquerade en postrouting para tráfico hacia IPs del bypass.
+# El kill-switch sigue activo para el resto del tráfico (no bypass).
+ENABLE_BYPASS="${ENABLE_BYPASS:-1}"
+BYPASS_REFRESH_MIN="${BYPASS_REFRESH_MIN:-2}"
+
+# Bypass UDP global: TODO UDP del cliente (excepto DNS al gateway) sale
+# directo sin Tor. Necesario para que funcionen apps como Discord voice,
+# Parsec, Zoom, juegos, llamadas WhatsApp — sus servidores RTC/UDP usan
+# IPs dinámicas que NO se pueden enumerar.
+#
+# Tradeoff: el ISP ve "tu IP → IP del servicio (encriptado)". El contenido
+# está protegido por TLS/SRTP/QUIC, pero el destino es visible. El TCP
+# sigue 100% por Tor (anonimato preservado para web/HTTPS).
+ENABLE_BYPASS_ALL_UDP="${ENABLE_BYPASS_ALL_UDP:-0}"
+
 BACKUP_DIR="/etc/onion-pi-backup-$(date +%Y%m%d-%H%M%S)"
 KEYS_OUT="/root/onion-pi-fwknop-keys.txt"
 WEBUI_PASSWD_FILE="/etc/onion-pi-webui.passwd"
@@ -111,6 +145,8 @@ OTA_STATE_FILE="/run/onion-pi-ota-state.json"
 WATCHDOG_STATE_FILE="/run/onion-pi-watchdog-state.json"
 BRIDGE_RESCUE_LOG="/var/log/onion-pi-bridge-rescue.log"
 BUNDLED_BRIDGES_DST="/etc/onion-pi/bridges_default.txt"
+BYPASS_LIST_FILE="/etc/onion-pi/bypass.txt"
+BYPASS_STATE_FILE="/run/onion-pi-bypass-state.json"
 STATE_FILE="/etc/onion-pi-installed"
 
 # ============================================================================
@@ -474,12 +510,23 @@ EOF
 configure_nftables() {
   header "Configurando nftables (kill-switch implícito)"
 
+  # LAN subnet (necesario para masquerade de bypass)
+  local LAN_NET
+  LAN_NET="$(echo "$GATEWAY_IP" | awk -F. '{print $1"."$2"."$3".0"}')/$SUBNET_MASK_BITS"
+
   cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
 # Generado por onion-pi setup
 flush ruleset
 
 table inet filter {
+    # IPs/CIDRs cuyo tráfico sale DIRECTO sin pasar por Tor (apps UDP, voz,
+    # juegos). Poblado dinámicamente por /usr/local/sbin/onion-pi-bypass-refresh.sh.
+    set bypass4 {
+        type ipv4_addr
+        flags interval
+    }
+
     chain input {
         type filter hook input priority 0; policy drop;
 
@@ -516,8 +563,14 @@ $( [[ -n "$SSH_LAN_CIDR" ]] && for cidr in ${SSH_LAN_CIDR//,/ }; do
 
     chain forward {
         type filter hook forward priority 0; policy drop;
-        # Sin forwarding. Tor escucha local. Si Tor cae → no hay internet.
-        # Esto es el kill-switch implícito.
+        # Bypass: tráfico de retorno desde IPs del bypass set ya conocidas
+        iifname "$WAN_IFACE" oifname "$WIFI_IFACE" ct state established,related accept
+        # Bypass: tráfico nuevo del cliente hacia IPs del bypass set (apps UDP/juegos)
+        iifname "$WIFI_IFACE" oifname "$WAN_IFACE" ip daddr @bypass4 accept
+$( [[ "$ENABLE_BYPASS_ALL_UDP" == "1" ]] && echo "        # BYPASS_ALL_UDP: todo UDP del cliente (excepto DNS:53 redirigido) sale directo
+        iifname \"$WIFI_IFACE\" oifname \"$WAN_IFACE\" meta l4proto udp accept" )
+        # Resto: drop. Tor maneja TCP localmente — no forwarding.
+        # Esto sigue siendo el kill-switch: si Tor cae, lo TCP no bypass muere.
     }
 
     chain output {
@@ -526,31 +579,46 @@ $( [[ -n "$SSH_LAN_CIDR" ]] && for cidr in ${SSH_LAN_CIDR//,/ }; do
 }
 
 table ip nat {
+    # Espejo del set bypass4 para uso en prerouting/postrouting (nft no permite
+    # compartir sets entre tablas). El refresh script actualiza ambos sincronizados.
+    set bypass4 {
+        type ipv4_addr
+        flags interval
+    }
+
     chain prerouting {
         type nat hook prerouting priority -100;
         # DNS al gateway → Tor DNS (debe ir ANTES del bypass para que las
-        # queries del cliente al :53 sí se redirijan).
+        # queries del cliente al :53 sí se redirijan a Tor).
         iifname "$WIFI_IFACE" udp dport 53 redirect to :$TOR_DNS_PORT
         iifname "$WIFI_IFACE" tcp dport 53 redirect to :$TOR_DNS_PORT
-        # Tráfico TCP al puerto del web UI en el gateway → pasar sin redirigir.
-        # (también SSH al gateway si está abierto en lan_in).
+        # Tráfico TCP al puerto del web UI/SSH del gateway → pasar sin redirigir.
         iifname "$WIFI_IFACE" ip daddr $GATEWAY_IP tcp dport { $WEBUI_PORT, $SSH_PORT } return
+        # Bypass: tráfico hacia IPs del bypass set → directo (no Tor).
+        iifname "$WIFI_IFACE" ip daddr @bypass4 return
         # Resto del TCP del cliente → Tor TransPort.
         iifname "$WIFI_IFACE" meta l4proto tcp redirect to :$TOR_TRANS_PORT
     }
 
     chain postrouting {
         type nat hook postrouting priority 100;
-        # Sin masquerade: nada sale al WAN sin pasar por Tor (proceso local).
+        # Masquerade para tráfico bypass (lo demás va por Tor que sale
+        # con la IP de la propia Pi, no necesita masquerade).
+        oifname "$WAN_IFACE" ip saddr $LAN_NET ip daddr @bypass4 masquerade
+$( [[ "$ENABLE_BYPASS_ALL_UDP" == "1" ]] && echo "        # BYPASS_ALL_UDP: masquerade del UDP del cliente que sale por WAN
+        oifname \"$WAN_IFACE\" ip saddr $LAN_NET meta l4proto udp masquerade" )
     }
 }
 EOF
 
-  # ip_forward OFF a propósito — Tor es local, no necesitamos forwarding
+  # ip_forward necesario para que el bypass funcione (forward chain).
+  # Las reglas nft garantizan que SOLO se forwarda a IPs del bypass4 set.
+  local fwd_val=0
+  [[ "$ENABLE_BYPASS" == "1" ]] && fwd_val=1
   if grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf; then
-    sed -i 's|^net.ipv4.ip_forward.*|net.ipv4.ip_forward=0|' /etc/sysctl.conf
+    sed -i "s|^net.ipv4.ip_forward.*|net.ipv4.ip_forward=$fwd_val|" /etc/sysctl.conf
   else
-    echo 'net.ipv4.ip_forward=0' >> /etc/sysctl.conf
+    echo "net.ipv4.ip_forward=$fwd_val" >> /etc/sysctl.conf
   fi
   sysctl -p >/dev/null 2>&1 || true
 
@@ -661,6 +729,9 @@ OTA_SCRIPT        = "/usr/local/sbin/onion-pi-ota-update.sh"
 OTA_STATE_FILE    = "/run/onion-pi-ota-state.json"
 WATCHDOG_STATE    = "/run/onion-pi-watchdog-state.json"
 WATCHDOG_SCRIPT   = "/usr/local/sbin/onion-pi-watchdog.sh"
+BYPASS_LIST_FILE  = "/etc/onion-pi/bypass.txt"
+BYPASS_STATE_FILE = "/run/onion-pi-bypass-state.json"
+BYPASS_REFRESH    = "/usr/local/sbin/onion-pi-bypass-refresh.sh"
 REBOOT_REQUIRED   = "/var/run/reboot-required"
 REBOOT_FLAG_LOCAL = "/run/onion-pi-needs-reboot"
 
@@ -716,6 +787,27 @@ def watchdog_state():
     except Exception:
         return {"state": "idle", "message": "Watchdog aún no ha corrido",
                 "active_clients": 0, "dns_ok": None, "socks_ok": None}
+
+def read_bypass():
+    try:
+        with open(BYPASS_LIST_FILE) as f:
+            return f.read()
+    except Exception:
+        return ""
+
+def save_bypass(text):
+    text = text.replace("\r", "")
+    if not text.endswith("\n"): text += "\n"
+    with open(BYPASS_LIST_FILE, "w") as f:
+        f.write(text)
+    os.chmod(BYPASS_LIST_FILE, 0o644)
+
+def bypass_state():
+    try:
+        with open(BYPASS_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"state": "idle", "count": 0, "domains": 0, "last_refresh": None}
 
 def read_hostapd():
     """Returns dict ssid/passphrase/channel/country_code."""
@@ -917,6 +1009,13 @@ def render(flash=None):
 <p class="muted">Último chequeo: {wd_when} · clientes activos: {wd_clients}</p>
 <form method="post" action="/api/watchdog/run" id="wdForm" style="display:inline"><button type="button" id="wdBtn">Ejecutar ahora</button></form>
 </div>"""
+
+    by = bypass_state()
+    bypass_count = by.get("count", 0)
+    bypass_domains = by.get("domains", 0)
+    bypass_last = html.escape(by.get("last_refresh") or "(nunca)")
+    bypass_text = html.escape(read_bypass())
+    bypass_refresh_min = os.environ.get("BYPASS_REFRESH_MIN", "5")
     return f"""<!doctype html><html lang="es"><head><meta charset="utf-8">
 <title>onion-pi · {ssid}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -961,6 +1060,14 @@ def render(flash=None):
 <button type="button" id="autoBridgeBtn" style="background:#3a8a3a">Buscar bridges públicos nuevos</button>
 <p class="muted">Una línea por bridge. Admite el formato con o sin prefijo 'Bridge'.<br>
 "Buscar nuevos" rota a bridges del pool público (Moat API + lista bundled) — el watchdog lo hace solo cuando detecta fallo, este botón lo dispara a demanda.</p></form></div>
+<div class="card"><h2>Bypass — apps directas sin Tor</h2>
+<p class="muted"><strong>⚠ Ojo:</strong> lo que pongas aquí sale DIRECTO por eth0 sin Tor. El ISP y el servicio destino verán tu IP real. Útil para apps con UDP/voz/streaming (Discord, Parsec, juegos) que <em>no pueden</em> funcionar por Tor.</p>
+<p class="muted">Bypass set activo ahora mismo: <strong>{bypass_count}</strong> IPs (de {bypass_domains} dominios resueltos · último refresh: {bypass_last})</p>
+<form method="post" action="/bypass">
+<textarea name="bypass" placeholder="# Una entrada por línea: dominio, IP o CIDR.&#10;discord.com&#10;gateway.discord.gg&#10;parsec.app&#10;162.159.0.0/16">{bypass_text}</textarea>
+<button type="submit">Guardar y refrescar</button>
+<p class="muted">Los dominios se re-resuelven cada {bypass_refresh_min}min via Tor DNS y el firewall se actualiza con las IPs resultantes.</p>
+</form></div>
 <div class="card"><h2>Mantenimiento</h2>
 <button id="otaBtn" type="button">Comprobar OTA ahora</button>
 <form method="post" action="/reboot" style="display:inline" onsubmit="return confirm('¿Reiniciar la Pi ahora? Tu sesión se cortará.')"><button type="submit" class="danger">Reiniciar Pi</button></form>
@@ -1258,6 +1365,13 @@ class H(BaseHTTPRequestHandler):
             subprocess.Popen(["systemd-run", "--unit=onion-pi-bridge-rescue-manual",
                               "--collect", "/usr/local/sbin/onion-pi-bridge-rescue.sh"])
             self._json({"ok": True})
+        elif p == "/bypass":
+            text = form.get("bypass", [""])[0]
+            save_bypass(text)
+            # Trigger refresh inmediato
+            subprocess.Popen(["systemd-run", "--unit=onion-pi-bypass-refresh-manual",
+                              "--collect", BYPASS_REFRESH])
+            self._redirect("/", "Bypass list guardada. Refresh en curso (~10s para resolver dominios).")
         elif p == "/reboot" or p == "/api/reboot":
             defer_restart_reboot()
             if p == "/api/reboot":
@@ -1514,7 +1628,7 @@ EOF
 # ============================================================================
 configure_watchdog() {
   [[ "$ENABLE_WATCHDOG" != "1" ]] && { warn "Watchdog deshabilitado (ENABLE_WATCHDOG=0)"; return 0; }
-  header "Configurando watchdog (cada ${WATCHDOG_INTERVAL_MIN} min)"
+  header "Configurando watchdog (cada ${WATCHDOG_INTERVAL_SEC}s · cooldown ${WATCHDOG_COOLDOWN_SEC}s)"
 
   # Necesitamos dig + curl en el path para los tests
   command -v dig  >/dev/null || apt-get install -y -qq dnsutils
@@ -1538,6 +1652,8 @@ TOR_DNS_PORT="$TOR_DNS_PORT"
 TOR_SOCKS_PORT="$TOR_SOCKS_PORT"
 LOG_TAG="onion-pi-watchdog"
 TEST_DOMAIN="\${TEST_DOMAIN:-example.com}"
+COOLDOWN=$WATCHDOG_COOLDOWN_SEC
+LAST_RESTART_FILE=/run/onion-pi-watchdog-last-restart
 
 log() { logger -t "\$LOG_TAG" "\$*"; echo "[\$LOG_TAG] \$*"; }
 
@@ -1593,18 +1709,31 @@ if [[ "\$DNS_OK" == "true" && "\$SOCKS_OK" == "true" ]]; then
   exit 0
 fi
 
-log "FALLO inicial · dns=\$DNS_OK socks=\$SOCKS_OK · intentando recuperar"
+# Cooldown: si reiniciamos Tor hace poco, no volver a tirarlo. Sólo observar.
+NOW=\$(date +%s)
+LAST=\$(cat "\$LAST_RESTART_FILE" 2>/dev/null || echo 0)
+ELAPSED=\$((NOW - LAST))
+if [[ \$ELAPSED -lt \$COOLDOWN ]]; then
+  REMAINING=\$((COOLDOWN - ELAPSED))
+  log "FALLO en cooldown · esperando \${REMAINING}s para no loopear restart"
+  write_state warning "En cooldown tras restart reciente (\${REMAINING}s restantes)" true "\$CLIENTS" "\$DNS_OK" "\$SOCKS_OK"
+  exit 0
+fi
+
+log "FALLO · dns=\$DNS_OK socks=\$SOCKS_OK · reiniciando Tor"
 write_state warning "Detectado fallo (dns=\$DNS_OK socks=\$SOCKS_OK), reiniciando Tor..." true "\$CLIENTS" "\$DNS_OK" "\$SOCKS_OK"
 
+echo "\$NOW" > "\$LAST_RESTART_FILE"
 systemctl restart tor@default
-# Esperar bootstrap (hasta 60s)
-for _ in \$(seq 1 30); do
+# Esperar bootstrap (hasta 45s). Si no llega, el watchdog del siguiente
+# tick (en \${WATCHDOG_INTERVAL_SEC}s) ya está esperando — no bloqueamos más.
+for _ in \$(seq 1 22); do
   sleep 2
   if grep -q "Bootstrapped 100%" /var/log/tor/notices.log 2>/dev/null; then
+    sleep 2  # un pelín extra para que listeners estén ready
     break
   fi
 done
-sleep 3  # asegurar que listeners están listos
 
 DNS_OK=false; SOCKS_OK=false
 dns_test  && DNS_OK=true
@@ -1667,9 +1796,12 @@ EOF
 Description=onion-pi watchdog timer
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=${WATCHDOG_INTERVAL_MIN}min
-RandomizedDelaySec=30s
+# Empezar 30s tras boot (da tiempo a que Tor bootstrapee inicial)
+OnBootSec=30s
+# Esperar N segundos DESPUÉS de que termine la ejecución anterior — así no
+# se solapan runs aunque un probe tarde lo suyo (dig 10s + curl 15s = 25s).
+OnUnitInactiveSec=${WATCHDOG_INTERVAL_SEC}s
+AccuracySec=2s
 Persistent=false
 
 [Install]
@@ -1683,7 +1815,7 @@ EOF
   fi
 
   systemctl daemon-reload
-  ok "Watchdog configurado · cada ${WATCHDOG_INTERVAL_MIN} min · journalctl -u onion-pi-watchdog"
+  ok "Watchdog configurado · cada ${WATCHDOG_INTERVAL_SEC}s · cooldown ${WATCHDOG_COOLDOWN_SEC}s · journalctl -u onion-pi-watchdog"
 }
 
 # ============================================================================
@@ -1874,6 +2006,246 @@ EOF
 }
 
 # ============================================================================
+# BYPASS — apps con UDP/voz (Discord, Parsec, juegos) salen DIRECTO sin Tor
+# ============================================================================
+configure_bypass() {
+  [[ "$ENABLE_BYPASS" != "1" ]] && { warn "Bypass deshabilitado"; return 0; }
+  header "Configurando bypass de Tor (apps UDP/voz/juegos)"
+
+  install -d -m 755 /etc/onion-pi
+
+  # Crear options.env con docs y todas las flags toggleables — sólo si no
+  # existe, para no pisar lo que el user haya tuneado.
+  if [[ ! -f /etc/onion-pi/options.env ]]; then
+    cat > /etc/onion-pi/options.env <<'EOF'
+# onion-pi · opciones persistentes
+# ─────────────────────────────────────────────────────────────────────────────
+# Estas variables se cargan al inicio de setup.sh (incluido por OTA), y
+# sobrescriben los defaults. Edítalas con un editor o desde tu shell:
+#   sudo nano /etc/onion-pi/options.env
+# Tras cambiar algo:
+#   sudo /home/.../rpi4-hide-traffic/setup.sh
+# (o espera al siguiente OTA semanal — recogerá los cambios).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# === Bypass UDP global ===
+# Si =1, TODO el UDP del cliente (excepto DNS al gateway) sale directo por
+# eth0 sin Tor. Necesario para Discord voice, Parsec, Zoom, juegos, llamadas
+# WhatsApp. El TCP sigue 100% por Tor. Tradeoff: el ISP ve los IPs destino
+# del UDP (no el contenido).
+#ENABLE_BYPASS_ALL_UDP=1
+
+# === Watchdog timing ===
+#WATCHDOG_INTERVAL_SEC=30      # cada cuánto chequear (segundos)
+#WATCHDOG_COOLDOWN_SEC=90      # mínimo entre restarts de Tor
+
+# === Bypass refresh ===
+#BYPASS_REFRESH_MIN=2          # cada cuánto re-resolver dominios bypass
+
+# === SSH desde la LAN ===
+# Subredes desde las que SSH (puerto 22) en eth0 está abierto sin fwknop.
+# Vacío = sólo fwknop SPA. Múltiples separadas por coma.
+#SSH_LAN_CIDR=192.168.1.0/24
+
+# === Bridges rescue ===
+#BRIDGE_RESCUE_KEEP_N=3        # cuántos bridges alive aplicar al rotar
+
+# === OTA ===
+#OTA_BRANCH=master
+EOF
+    chmod 644 /etc/onion-pi/options.env
+    ok "Opciones persistentes en /etc/onion-pi/options.env (toda comentado por defecto)"
+  fi
+
+  if [[ ! -f "$BYPASS_LIST_FILE" ]]; then
+    cat > "$BYPASS_LIST_FILE" <<'EOF'
+# onion-pi · bypass list
+# ─────────────────────────────────────────────────────────────────────────────
+# Una entrada por línea. Pueden ser:
+#   - Dominios   (se resuelven cada N min y se añaden las IPs al firewall)
+#   - IPs        (1.2.3.4)
+#   - CIDRs      (162.159.128.0/19)
+# Las entradas que empiezan por # son comentarios.
+#
+# CUIDADO: lo que pongas aquí sale DIRECTO sin Tor — el ISP y el servicio
+# destino verán tu IP real para ese tráfico.
+#
+# Ejemplos comunes (descomenta los que quieras):
+#
+# === Discord (voz/vídeo usan UDP, no funcionan por Tor) ===
+# discord.com
+# gateway.discord.gg
+# discordapp.com
+# cdn.discordapp.com
+# media.discordapp.net
+# Range Cloudflare/Discord (más amplio, captura los voice servers):
+# 162.159.0.0/16
+#
+# === Parsec (streaming P2P UDP) ===
+# parsec.app
+# parsecgaming.com
+#
+# === Llamadas WhatsApp/Telegram ===
+# whatsapp.com
+# *.whatsapp.net
+# telegram.org
+#
+# === Zoom/Meet (UDP voz) ===
+# zoom.us
+# meet.google.com
+EOF
+    chmod 644 "$BYPASS_LIST_FILE"
+    ok "Bypass list creado vacío en $BYPASS_LIST_FILE (todos comentarios)"
+  fi
+
+  cat > /usr/local/sbin/onion-pi-bypass-refresh.sh <<EOF
+#!/usr/bin/env bash
+# onion-pi bypass refresh — lee $BYPASS_LIST_FILE, resuelve los dominios
+# (vía Tor DNS para no levantar sospechas en el ISP), y puebla los sets
+# bypass4 en las tablas inet/filter y ip/nat con las IPs resultantes
+# + las IPs/CIDRs literales que el usuario haya puesto.
+# Atómico vía 'nft -f'. Idempotente. Corre cada $BYPASS_REFRESH_MIN min.
+set -uo pipefail
+LIST="$BYPASS_LIST_FILE"
+STATE="$BYPASS_STATE_FILE"
+GATEWAY_IP="$GATEWAY_IP"
+TOR_DNS_PORT="$TOR_DNS_PORT"
+LOG_TAG=onion-pi-bypass-refresh
+
+log() { logger -t "\$LOG_TAG" "\$*"; echo "[\$LOG_TAG] \$*"; }
+
+[[ -f "\$LIST" ]] || { log "no \$LIST — nada que hacer"; exit 0; }
+
+# Parsear y clasificar entradas
+TMPDIR=\$(mktemp -d)
+trap 'rm -rf "\$TMPDIR"' EXIT
+DOMAINS="\$TMPDIR/domains"
+IPS="\$TMPDIR/ips"
+: > "\$DOMAINS"; : > "\$IPS"
+
+while IFS= read -r line; do
+  # quitar comentarios y trim
+  line="\${line%%#*}"
+  line="\$(echo "\$line" | tr -d '[:space:]')"
+  [[ -z "\$line" ]] && continue
+  if [[ "\$line" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+(/[0-9]+)?\$ ]]; then
+    echo "\$line" >> "\$IPS"
+  elif [[ "\$line" =~ ^[a-zA-Z0-9.*-]+\\.[a-zA-Z]+\$ ]]; then
+    echo "\$line" >> "\$DOMAINS"
+  fi
+done < "\$LIST"
+
+DOMAINS_N=\$(wc -l < "\$DOMAINS")
+log "Procesando \$DOMAINS_N dominios + \$(wc -l < "\$IPS") IPs/CIDRs"
+
+# Resolver dominios vía Tor DNS (port 5353 en gateway). Si falla, fallback a 1.1.1.1.
+RESOLVED="\$TMPDIR/resolved"
+: > "\$RESOLVED"
+while IFS= read -r d; do
+  [[ -z "\$d" ]] && continue
+  # quitar leading "*." si hay wildcard
+  d="\${d#\\*.}"
+  ips=\$(timeout 8 dig +time=5 +tries=2 +short A "\$d" @"\$GATEWAY_IP" -p "\$TOR_DNS_PORT" 2>/dev/null | grep -E '^[0-9.]+\$' || true)
+  if [[ -z "\$ips" ]]; then
+    ips=\$(timeout 5 dig +time=3 +tries=1 +short A "\$d" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+\$' || true)
+  fi
+  if [[ -n "\$ips" ]]; then
+    echo "\$ips" >> "\$RESOLVED"
+  else
+    log "no se pudo resolver: \$d"
+  fi
+done < "\$DOMAINS"
+
+# Combinar IPs literales + resueltas, deduplicar con collapse_addresses
+# (importante: nft con flags=interval no acepta IPs dentro de un CIDR ya
+# presente — colapsamos primero para evitar 'conflicting intervals').
+ALL="\$TMPDIR/all"
+cat "\$IPS" "\$RESOLVED" 2>/dev/null | sort -u | python3 -c "
+import sys, ipaddress
+nets = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        nets.append(ipaddress.ip_network(line, strict=False))
+    except ValueError:
+        pass
+for n in ipaddress.collapse_addresses(nets):
+    print(n.with_prefixlen if n.prefixlen != 32 else n.network_address)
+" > "\$ALL"
+COUNT=\$(wc -l < "\$ALL")
+log "Set bypass4 final: \$COUNT entradas (tras colapso de rangos solapados)"
+
+# Generar rules nft atómicas: flush + add element en ambas tablas
+NFT_CMD="\$TMPDIR/cmd.nft"
+{
+  echo "flush set inet filter bypass4"
+  echo "flush set ip nat bypass4"
+  if [[ \$COUNT -gt 0 ]]; then
+    ELEMS=\$(paste -sd, "\$ALL")
+    echo "add element inet filter bypass4 { \$ELEMS }"
+    echo "add element ip nat bypass4 { \$ELEMS }"
+  fi
+} > "\$NFT_CMD"
+
+if nft -f "\$NFT_CMD"; then
+  log "aplicado OK"
+  python3 -c "
+import json, time
+json.dump({
+  'count': \$COUNT,
+  'domains': \$DOMAINS_N,
+  'last_refresh': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+  'state': 'ok',
+}, open('\$STATE', 'w'))
+" 2>/dev/null || true
+else
+  log "ERROR aplicando nft"
+  python3 -c "
+import json, time
+json.dump({
+  'count': 0,
+  'state': 'error',
+  'last_refresh': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+}, open('\$STATE', 'w'))
+" 2>/dev/null || true
+  exit 1
+fi
+EOF
+  chmod 755 /usr/local/sbin/onion-pi-bypass-refresh.sh
+
+  cat > /etc/systemd/system/onion-pi-bypass-refresh.service <<EOF
+[Unit]
+Description=onion-pi bypass list refresh (resolve domains → nft set)
+After=network-online.target tor.service nftables.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/onion-pi-bypass-refresh.sh
+StandardOutput=journal
+StandardError=journal
+EOF
+
+  cat > /etc/systemd/system/onion-pi-bypass-refresh.timer <<EOF
+[Unit]
+Description=onion-pi bypass refresh timer
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${BYPASS_REFRESH_MIN}min
+RandomizedDelaySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  ok "Bypass configurado · lista en $BYPASS_LIST_FILE · refresh cada ${BYPASS_REFRESH_MIN}min"
+}
+
+# ============================================================================
 # HEALTHCHECK — servicio que se ejecuta en cada arranque
 # ============================================================================
 install_healthcheck() {
@@ -1929,6 +2301,8 @@ start_services() {
       systemctl enable onion-pi-ota.timer >/dev/null 2>&1 || true
   [[ "$ENABLE_WATCHDOG" == "1" && -f /etc/systemd/system/onion-pi-watchdog.timer ]] && \
       systemctl enable onion-pi-watchdog.timer >/dev/null 2>&1 || true
+  [[ "$ENABLE_BYPASS" == "1" && -f /etc/systemd/system/onion-pi-bypass-refresh.timer ]] && \
+      systemctl enable onion-pi-bypass-refresh.timer >/dev/null 2>&1 || true
 
   systemctl restart onion-pi-wlan.service
   systemctl restart nftables
@@ -1941,6 +2315,10 @@ start_services() {
       systemctl restart onion-pi-ota.timer 2>/dev/null || true
   [[ "$ENABLE_WATCHDOG" == "1" && -f /etc/systemd/system/onion-pi-watchdog.timer ]] && \
       systemctl restart onion-pi-watchdog.timer 2>/dev/null || true
+  [[ "$ENABLE_BYPASS" == "1" && -f /etc/systemd/system/onion-pi-bypass-refresh.timer ]] && \
+      systemctl restart onion-pi-bypass-refresh.timer 2>/dev/null || true
+  # Trigger inicial del refresh para poblar el set
+  [[ "$ENABLE_BYPASS" == "1" ]] && systemctl start onion-pi-bypass-refresh.service 2>/dev/null || true
 
   ok "Servicios en marcha"
 }
@@ -2066,8 +2444,9 @@ EOF
   if [[ "$ENABLE_WATCHDOG" == "1" && -f /usr/local/sbin/onion-pi-watchdog.sh ]]; then
     cat <<EOF
   ${BLD}Watchdog${RST}
-    Cada ${WATCHDOG_INTERVAL_MIN} min comprueba que Tor enruta DNS+SOCKS correctamente.
-    Si falla, reinicia Tor. Si tras restart sigue fallando, lo marca en la UI.
+    Cada ${WATCHDOG_INTERVAL_SEC}s comprueba DNS+SOCKS por Tor. Si falla → restart
+    Tor (con cooldown de ${WATCHDOG_COOLDOWN_SEC}s para no loopear). Si sigue fallando
+    → bridge-rescue. Si todo falla → marca error en la UI.
     Manual:     sudo /usr/local/sbin/onion-pi-watchdog.sh
     Timer:      systemctl list-timers onion-pi-watchdog.timer
     Logs:       journalctl -u onion-pi-watchdog.service · journalctl -t onion-pi-watchdog
@@ -2094,6 +2473,7 @@ main() {
   configure_ota
   configure_watchdog
   configure_bridge_rescue
+  configure_bypass
   install_healthcheck
   start_services
   verify || warn "Verificación con incidencias — revisa los logs"
